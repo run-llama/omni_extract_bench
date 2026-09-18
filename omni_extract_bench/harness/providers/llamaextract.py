@@ -31,6 +31,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .envelope import write_output
+from ..nullable_schema import restore_nullability
 
 BASE = "https://api.cloud.llamaindex.ai"
 # Overridable so a caller can select the maximum tier without editing this module.
@@ -43,11 +44,12 @@ _TERMINAL = {"SUCCESS", "COMPLETED", "FAILED", "ERROR", "CANCELLED"}
 
 
 def _adapt_schema(schema: dict, defs: dict | None = None) -> dict:
-    """Inline $ref/$defs, drop $-prefixed metadata keys, and collapse type-lists to a
-    single type. The latter is required: LlamaExtract turns `"type": ["array","null"]`
-    into an anyOf and the array branch loses its `items` → 400 schema_validation. We
-    drop the "null" so arrays/objects/scalars stay single-typed (items preserved). No
-    field, description, enum, or type-category is changed — pure dialect cleanup."""
+    """Prepare non-null branches: inline refs, infer enum types, and retain items.
+
+    A prior type-list conversion lost array items during API validation. Keep the
+    complete non-null branch here; restore_nullability reinstates the original
+    null alternatives with anyOf before the request is sent.
+    """
     if defs is None:
         defs = schema.get("$defs", {})
     if not isinstance(schema, dict):
@@ -60,8 +62,7 @@ def _adapt_schema(schema: dict, defs: dict | None = None) -> dict:
 
     # Collapse a union to its non-null branch. Recursing into the branches while LEAVING the
     # anyOf in place produced `properties.skills.anyOf.anyOf.1...` -- a nested union the API
-    # rejects. Same resolution the grader applies when scoring, so what is sent matches how the
-    # answer is judged.
+    # rejects. Prepare the non-null branch here; restore null alternatives at submission.
     for comb in ("anyOf", "oneOf", "allOf"):
         branches = [b for b in (node.get(comb) or []) if isinstance(b, dict)]
         if branches:
@@ -88,8 +89,8 @@ def _adapt_schema(schema: dict, defs: dict | None = None) -> dict:
 
     # Once a type is declared, every enum member must match it: leaving the `null` in
     # `["MILD","MODERATE","SEVERE",null]` alongside `type: string` fails with "Input should be
-    # a valid string at ...enum.3". Nullability is carried by the field being optional, not by
-    # a null enum member, so the null is removed rather than the type loosened.
+    # a valid string at ...enum.3". Remove null from this typed branch; the request's
+    # separate null alternative restores it independently of required membership.
     if isinstance(node.get("enum"), list) and node.get("type") in (
             "string", "boolean", "integer", "number"):
         node["enum"] = [v for v in node["enum"] if v is not None]
@@ -192,7 +193,7 @@ def run(pdf: Path, schema: dict, out: Path, key: str, poll_interval: int) -> Non
             "configuration": {
                 "tier": TIER,
                 "extraction_target": "per_doc",
-                "data_schema": _adapt_schema(schema),
+                "data_schema": restore_nullability(schema, _adapt_schema(schema)),
             },
         }
         job = _req(
